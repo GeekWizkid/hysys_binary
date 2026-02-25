@@ -55,7 +55,7 @@ typedef struct
 } TEXT_U8 <read=ReadTEXT_U8>;
 
 
-// Read-функции (чтобы TEXT_* показывались как строка в Value) :contentReference[oaicite:2]{index=2}
+// Read-функции (чтобы TEXT_* показывались как строка в Value)
 string ReadTEXT_U32( TEXT_U32 &t )
 {
     if( exists(t.text) )
@@ -69,6 +69,211 @@ string ReadTEXT_U8( TEXT_U8 &t )
         return t.text;
     return "";
 }
+
+
+// ------------------------------------------------------------
+// Compact integers / addresses used inside CC CD chunks
+// ------------------------------------------------------------
+
+// Используем глобальную границу, чтобы парсинг чанков не вылезал
+// за пределы ObjectData конкретного объекта.
+local int64 g_objectDataEnd = -1;
+
+// compact int: если < 255 -> 1 байт, иначе 0xFF + int32 (LE)
+typedef struct
+{
+    ubyte tag <name="Tag">;
+    if( tag == 0xFF )
+        int value32 <name="Value32">;
+} CINT <read=ReadCINT>;
+
+int GetCINT( CINT &c )
+{
+    if( c.tag == 0xFF )
+        return c.value32;
+    return (int)c.tag;
+}
+
+string ReadCINT( CINT &c )
+{
+    local string s;
+    SPrintf( s, "%d", GetCINT(c) );
+    return s;
+}
+
+// compact address: 0xFE = NULL/terminator, иначе как CINT (0..254 или 0xFF+int32)
+typedef struct
+{
+    ubyte tag <name="Tag">;
+    if( tag == 0xFF )
+        int value32 <name="Value32">;
+} CADDR <read=ReadCADDR>;
+
+int GetCADDR( CADDR &a )
+{
+    if( a.tag == 0xFE )
+        return -1; // NULL / end
+    if( a.tag == 0xFF )
+        return a.value32;
+    return (int)a.tag;
+}
+
+string ReadCADDR( CADDR &a )
+{
+    local string s;
+    if( a.tag == 0xFE )
+        return "NULL";
+    SPrintf( s, "%d", GetCADDR(a) );
+    return s;
+}
+
+// Текст внутри чанков часто тоже через compact length
+// [CINT len][len bytes]
+typedef struct
+{
+    CINT len <name="Length">;
+
+    local int L = GetCINT(len);
+    if( L > 0 )
+        char text[L] <name="Text">;
+
+} TEXT_C <read=ReadTEXT_C>;
+
+string ReadTEXT_C( TEXT_C &t )
+{
+    if( exists(t.text) )
+        return t.text;
+    return "";
+}
+
+
+// -----------------------------
+// Chunk header: CC CD / CC CE
+// [ushort marker][int version][CINT size]
+// -----------------------------
+typedef struct
+{
+    ushort chunkMarker <name="ChunkMarker">; // bytes CC CD => value 0xCDCC
+    int    chunkVersion <name="ChunkVersion">;
+    CINT   chunkSize <name="ChunkSize">;
+
+} CHUNK_HDR <read=ReadCHUNK_HDR>;
+
+string ReadCHUNK_HDR( CHUNK_HDR &h )
+{
+    local string s;
+    SPrintf( s, "mk=0x%04X ver=%d size=%d", h.chunkMarker, h.chunkVersion, GetCINT(h.chunkSize) );
+    return s;
+}
+
+
+// -----------------------------
+// Generic chunk: просто съесть payload по size
+// -----------------------------
+typedef struct
+{
+    CHUNK_HDR hdr <name="Hdr">;
+
+    local int  payloadSize = GetCINT(hdr.chunkSize);
+    local int64 payloadStart = FTell();
+    local int64 payloadEnd   = payloadStart + (int64)payloadSize;
+
+    if( g_objectDataEnd > 0 && payloadEnd > g_objectDataEnd )
+        payloadEnd = g_objectDataEnd;
+
+    local int payloadLen = (int)(payloadEnd - payloadStart);
+    if( payloadLen > 0 )
+        ubyte payload[payloadLen] <name="Payload">;
+
+} GENERIC_CHUNK;
+
+
+// -----------------------------
+// ClassData chunk (StoreClassData)
+// ChunkVersion обычно 7
+// payload:
+//   Addr list: CADDR addrId; if addrId!=NULL -> CINT val; ... terminator CADDR(NULL)
+//   Parent: CADDR
+//   ActiveTabIndex: CINT
+//   MiscItems: [CINT itemId][TEXT name][(chunks...)] ... terminator itemId==0
+//   Storage tail (raw)
+// -----------------------------
+typedef struct
+{
+    CHUNK_HDR hdr <name="ClassDataHeader">;
+
+    local int  payloadSize = GetCINT(hdr.chunkSize);
+    local int64 payloadStart = FTell();
+    local int64 payloadEnd   = payloadStart + (int64)payloadSize;
+
+    if( g_objectDataEnd > 0 && payloadEnd > g_objectDataEnd )
+        payloadEnd = g_objectDataEnd;
+
+    // ---- Address list (AddrId + Value) ... until NULL ----
+    while( FTell() < payloadEnd )
+    {
+        CADDR addrId <name="AddrId">;
+        if( addrId.tag == 0xFE )
+            break;
+
+        CINT addrValue <name="AddrValue">;
+    }
+
+    // ---- Parent ----
+    if( FTell() < payloadEnd )
+        CADDR parentId <name="ParentId">;
+
+    // ---- activeTabIndex ----
+    if( FTell() < payloadEnd )
+        CINT activeTabIndex <name="ActiveTabIndex">;
+
+    // ---- Misc items ----
+    local int itemIdVal = 0;
+    local ushort mk = 0;
+
+    while( FTell() < payloadEnd )
+    {
+        CINT itemId <name="ItemId">;
+        itemIdVal = GetCINT(itemId);
+        if( itemIdVal == 0 )
+            break;
+
+        // Text name (best-effort)
+        TEXT_C itemName <name="ItemName">;
+
+        // Если дальше идут chunk'и (CC CD / CC CE), попробуем их съесть.
+        // Если не chunk, выходим и оставляем хвост raw.
+        if( FTell() + 2 <= payloadEnd )
+        {
+            mk = ReadUShort(FTell());
+            if( mk == 0xCDCC || mk == 0xCECC )
+            {
+                while( FTell() + 2 <= payloadEnd )
+                {
+                    mk = ReadUShort(FTell());
+                    if( mk == 0xCDCC || mk == 0xCECC )
+                        GENERIC_CHUNK itemChunk <name="ItemChunk">;
+                    else
+                        break;
+                }
+            }
+            else
+            {
+                break;
+            }
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    // ---- Tail (Storage / остаток) ----
+    local int tailLen = (int)(payloadEnd - FTell());
+    if( tailLen > 0 )
+        ubyte classDataTail[tailLen] <name="ClassDataTail">;
+
+} CLASSDATA_CHUNK;
 
 
 // =====================
@@ -135,7 +340,7 @@ if( headerDataSize > 0 )
 // Object record:
 // CC CC
 // FC
-// type (ushort, LE)
+// saveID (ushort, LE)
 // size (uint32, BE)  -> objectSize bytes AFTER size field
 // name: TEXT_U8 (ubyte len + bytes)
 // payload: remaining
@@ -144,10 +349,10 @@ typedef struct
 {
     ushort marker <name="Marker">;      // 0xCCCC
     ubyte  fc     <name="TypePrefix">;  // 0xFC
-    ushort typeId <name="TypeId">;      // LE
+    ushort saveID <name="SaveID">;      // LE
 
     // end marker: CC CC FC FF 7F
-    if( typeId != 0x7FFF )
+    if( saveID != 0x7FFF )
     {
         BigEndian();
         uint objectSize <name="ObjectSize">;
@@ -164,17 +369,48 @@ typedef struct
             remaining = objectSize - consumed;
 
         if( remaining > 0 )
-            ubyte objectData[remaining] <name="ObjectData">;
+        {
+            local int64 objDataStart = FTell();
+            local int64 objDataEnd   = objDataStart + (int64)remaining;
+            local ushort mk0 = 0;
+            local ushort mk  = 0;
+
+            g_objectDataEnd = objDataEnd;
+
+            // 1) ClassData первым чанком (обычно CC CD / CC CE)
+            if( FTell() + 2 <= objDataEnd )
+            {
+                mk0 = ReadUShort( FTell() );
+                if( mk0 == 0xCDCC || mk0 == 0xCECC )
+                    CLASSDATA_CHUNK classData <name="ClassData">;
+            }
+
+            // 2) Дальше: остальные чанки (покажет версию/размер)
+            while( FTell() + 2 <= objDataEnd )
+            {
+                mk = ReadUShort( FTell() );
+                if( mk == 0xCDCC || mk == 0xCECC )
+                    GENERIC_CHUNK chunk <name="Chunk">;
+                else
+                    break;
+            }
+
+            // 3) Хвост, если остался
+            if( FTell() < objDataEnd )
+                ubyte objectDataRest[(int)(objDataEnd - FTell())] <name="ObjectDataRest">;
+
+            g_objectDataEnd = -1;
+        }
     }
 
 } OBJECT_RECORD <read=ReadOBJECT_RECORD>;
 
 
-// Показывать строку рядом с объектом (в Value) :contentReference[oaicite:3]{index=3}
+// Показывать строку рядом с объектом (в Value)
 string ReadOBJECT_RECORD( OBJECT_RECORD &o )
 {
     // EndMarker
-    if( o.typeId == 0x7FFF )
+    if( o.saveID == 0x7FFF )
         return "END_MARKER";
 
     local string nm = "";
@@ -186,9 +422,9 @@ string ReadOBJECT_RECORD( OBJECT_RECORD &o )
 
     local string s;
     if( exists(o.objectSize) )
-        SPrintf( s, "%s | type=0x%04X | size=%u", nm, o.typeId, o.objectSize );
+        SPrintf( s, "%s | saveID=0x%04X | size=%u", nm, o.saveID, o.objectSize );
     else
-        SPrintf( s, "%s | type=0x%04X", nm, o.typeId );
+        SPrintf( s, "%s | saveID=0x%04X", nm, o.saveID );
 
     return s;
 }
@@ -206,7 +442,7 @@ local int64 scanPos  = objectsStart;
 local int parsedCount = 0;
 local int endFound    = 0;
 
-// переменные вынесены из цикла (как ты и сделал)
+// переменные вынесены из цикла
 local int64  found;
 local ushort tid;
 local uint   sz;
@@ -220,7 +456,7 @@ while( scanPos >= 0 && scanPos < fileSize )
     if( found < 0 )
         break;
 
-    // минимум: CC CC FC + typeId(2)
+    // минимум: CC CC FC + saveID(2)
     if( found + 5 > fileSize )
         break;
 
@@ -245,7 +481,7 @@ while( scanPos >= 0 && scanPos < fileSize )
 
         Assert(EndMarker.marker == 0xCCCC, "EndMarker: expected 0xCCCC");
         Assert(EndMarker.fc     == 0xFC,   "EndMarker: expected 0xFC");
-        Assert(EndMarker.typeId == 0x7FFF, "EndMarker: expected typeId 0x7FFF");
+        Assert(EndMarker.saveID == 0x7FFF, "EndMarker: expected saveID 0x7FFF");
 
         endFound = 1;
         break;
@@ -288,7 +524,7 @@ while( scanPos >= 0 && scanPos < fileSize )
     if( COLOR_OBJECTS )
     {
         objColor = MakeObjectColor( parsedCount, found );
-        SetBackColor( objColor ); // действует на все переменные, объявленные дальше :contentReference[oaicite:4]{index=4}
+        SetBackColor( objColor );
     }
 
     // парсим объект
