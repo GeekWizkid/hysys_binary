@@ -1,0 +1,310 @@
+// HYSYS.bt
+LittleEndian();
+
+// ------------------------------------------------------------
+// Настройки
+// ------------------------------------------------------------
+local int COLOR_OBJECTS = 1;  // 1 = красить каждый объект, 0 = выключить
+
+// ------------------------------------------------------------
+// Helper: псевдо-рандомный, но стабильный цвет по (index, pos)
+// Цвет в 010 Editor: 0xBBGGRR
+// ------------------------------------------------------------
+int MakeObjectColor( int index, int64 pos )
+{
+    local uint x;
+    local ubyte r, g, b;
+
+    // мешаем pos и index
+    x = (uint)(pos ^ (pos >> 32));
+    x ^= (uint)(index * 2654435761); // 0x9E3779B1 (чтобы хорошо мешало)
+    x = x * 1664525 + 1013904223;    // LCG
+
+    // чтобы цвета были читаемые: компоненты 0x40..0xBF
+    r = 0x40 + (ubyte)( x        & 0x7F);
+    g = 0x40 + (ubyte)((x >>  8) & 0x7F);
+    b = 0x40 + (ubyte)((x >> 16) & 0x7F);
+
+    return ((int)b << 16) | ((int)g << 8) | (int)r;
+}
+
+
+// =====================
+// TEXT_U32: [uint len][len bytes]
+// =====================
+typedef struct
+{
+    uint len <name="Length">;
+
+    if( len > 0 )
+        char text[len] <name="Text">;
+
+} TEXT_U32 <read=ReadTEXT_U32>;
+
+
+// =====================
+// TEXT_U8: [ubyte len][len bytes]
+// =====================
+typedef struct
+{
+    ubyte len <name="Length">;
+
+    if( len > 0 )
+        char text[len] <name="Text">;
+
+} TEXT_U8 <read=ReadTEXT_U8>;
+
+
+// Read-функции (чтобы TEXT_* показывались как строка в Value) :contentReference[oaicite:2]{index=2}
+string ReadTEXT_U32( TEXT_U32 &t )
+{
+    if( exists(t.text) )
+        return t.text;
+    return "";
+}
+
+string ReadTEXT_U8( TEXT_U8 &t )
+{
+    if( exists(t.text) )
+        return t.text;
+    return "";
+}
+
+
+// =====================
+// PackedBinaryFileHeader
+// =====================
+typedef struct
+{
+    char  myBogusID[16] <name="myBogusID">;
+
+    ubyte version       <name="Version">;
+    uint  requiredBuild <name="RequiredBuild">;
+    uint  buildVersion  <name="BuildVersion">;
+
+    ubyte caseType      <name="CaseType">;
+    uint  isCompact     <name="isCompact">;
+
+    TEXT_U32 description <name="Description">;
+
+} PACKED_BINARY_FILE_HEADER
+  <name="PackedBinaryFileHeader", open=true, style=sHeading2>;
+
+FSeek(0);
+PACKED_BINARY_FILE_HEADER hdr;
+
+Assert(hdr.version == 3, "Unexpected header version (expected 3)");
+Assert(hdr.isCompact == 1, "Unexpected isCompact flag (writer writes 1)");
+
+AddBookmark(0, "Header", "PACKED_BINARY_FILE_HEADER");
+
+
+// =====================
+// PREO header
+// =====================
+typedef struct
+{
+    ubyte objectCount        <name="ObjectCount">;
+    char  preoTag[4]         <name="Tag (PREO)">;
+
+    ubyte preoHeaderVersion  <name="PREOHeaderVersion">;
+    uint  formatLevel        <name="FormatLevel">;
+
+} PREO_HEADER
+  <name="PREOHeader", open=true, style=sHeading3>;
+
+local int64 preoOff = FTell();
+PREO_HEADER preo;
+
+Assert(preo.preoTag[0]=='P' && preo.preoTag[1]=='R' && preo.preoTag[2]=='E' && preo.preoTag[3]=='O',
+       "Missing PREO tag");
+
+AddBookmark(preoOff, "PREO header", "PREO_HEADER");
+
+
+// =====================
+// HeaderDataSize + HeaderData (raw)
+// =====================
+ubyte headerDataSize <name="HeaderDataSize">;
+
+if( headerDataSize > 0 )
+    ubyte headerData[headerDataSize] <name="CollectionHeaderData (raw)">;
+
+
+// =====================
+// Object record:
+// CC CC
+// FC
+// type (ushort, LE)
+// size (uint32, BE)  -> objectSize bytes AFTER size field
+// name: TEXT_U8 (ubyte len + bytes)
+// payload: remaining
+// =====================
+typedef struct
+{
+    ushort marker <name="Marker">;      // 0xCCCC
+    ubyte  fc     <name="TypePrefix">;  // 0xFC
+    ushort typeId <name="TypeId">;      // LE
+
+    // end marker: CC CC FC FF 7F
+    if( typeId != 0x7FFF )
+    {
+        BigEndian();
+        uint objectSize <name="ObjectSize">;
+        LittleEndian();
+
+        local int64 payloadStart = FTell();
+
+        TEXT_U8 objectName <name="ObjectName">;
+
+        local uint consumed  = (uint)(FTell() - payloadStart);
+        local uint remaining = 0;
+
+        if( objectSize > consumed )
+            remaining = objectSize - consumed;
+
+        if( remaining > 0 )
+            ubyte objectData[remaining] <name="ObjectData">;
+    }
+
+} OBJECT_RECORD <read=ReadOBJECT_RECORD>;
+
+
+// Показывать строку рядом с объектом (в Value) :contentReference[oaicite:3]{index=3}
+string ReadOBJECT_RECORD( OBJECT_RECORD &o )
+{
+    // EndMarker
+    if( o.typeId == 0x7FFF )
+        return "END_MARKER";
+
+    local string nm = "";
+    if( exists(o.objectName) && exists(o.objectName.text) )
+        nm = o.objectName.text;
+
+    if( nm == "" )
+        nm = "(no name)";
+
+    local string s;
+    if( exists(o.objectSize) )
+        SPrintf( s, "%s | type=0x%04X | size=%u", nm, o.typeId, o.objectSize );
+    else
+        SPrintf( s, "%s | type=0x%04X", nm, o.typeId );
+
+    return s;
+}
+
+
+// =====================
+// Objects scan by signature CCCCFC
+// =====================
+local int64 objectsStart = FTell();
+AddBookmark(objectsStart, "ObjectsStart", "ubyte");
+
+local int64 fileSize = FileSize();
+local int64 scanPos  = objectsStart;
+
+local int parsedCount = 0;
+local int endFound    = 0;
+
+// переменные вынесены из цикла (как ты и сделал)
+local int64  found;
+local ushort tid;
+local uint   sz;
+local ubyte  nameLen;
+local int64  nextPos;
+local int    objColor;
+
+while( scanPos >= 0 && scanPos < fileSize )
+{
+    found = FindFirst( "CCCCFC,h", true, false, 0, 0.0, 1, scanPos );
+    if( found < 0 )
+        break;
+
+    // минимум: CC CC FC + typeId(2)
+    if( found + 5 > fileSize )
+        break;
+
+    // быстрый отсев мусора
+    if( ReadUShort(found) != 0xCCCC || ReadUByte(found+2) != 0xFC )
+    {
+        scanPos = found + 1;
+        continue;
+    }
+
+    tid = ReadUShort(found + 3);
+
+    // EndMarker: CC CC FC FF 7F
+    if( tid == 0x7FFF )
+    {
+        if( COLOR_OBJECTS ) SetBackColor( cLtGray );
+
+        FSeek(found);
+        OBJECT_RECORD EndMarker <name="EndMarker", open=true, optimize=false>;
+
+        if( COLOR_OBJECTS ) SetBackColor( cNone );
+
+        Assert(EndMarker.marker == 0xCCCC, "EndMarker: expected 0xCCCC");
+        Assert(EndMarker.fc     == 0xFC,   "EndMarker: expected 0xFC");
+        Assert(EndMarker.typeId == 0x7FFF, "EndMarker: expected typeId 0x7FFF");
+
+        endFound = 1;
+        break;
+    }
+
+    // objectSize: BE uint at found+5
+    BigEndian();
+    sz = ReadUInt(found + 5);
+    LittleEndian();
+
+    // Полная длина записи = 2+1+2+4 + sz = 9 + sz
+    if( (found + 9 + (int64)sz) > fileSize )
+    {
+        scanPos = found + 1;
+        continue;
+    }
+
+    // nameLen лежит по found+9
+    nameLen = ReadUByte(found + 9);
+    if( sz < (uint)(1 + nameLen) )
+    {
+        scanPos = found + 1;
+        continue;
+    }
+
+    // следующий объект/эндмаркер должен начинаться ровно там
+    nextPos = found + 9 + (int64)sz;
+    if( nextPos + 5 > fileSize )
+    {
+        scanPos = found + 1;
+        continue;
+    }
+    if( ReadUShort(nextPos) != 0xCCCC || ReadUByte(nextPos+2) != 0xFC )
+    {
+        scanPos = found + 1;
+        continue;
+    }
+
+    // ---- красим объект (перед объявлением) ----
+    if( COLOR_OBJECTS )
+    {
+        objColor = MakeObjectColor( parsedCount, found );
+        SetBackColor( objColor ); // действует на все переменные, объявленные дальше :contentReference[oaicite:4]{index=4}
+    }
+
+    // парсим объект
+    FSeek(found);
+    OBJECT_RECORD Object <name="Object", open=true, optimize=false>;
+    parsedCount++;
+
+    // сброс цвета
+    if( COLOR_OBJECTS )
+        SetBackColor( cNone );
+
+    // ресинхронизация на границу
+    FSeek(nextPos);
+    scanPos = nextPos;
+}
+
+Assert(endFound, "EndMarker not found (scan by CCCCFC failed)");
+
+// Printf("Parsed objects=%d, preo.objectCount=%d\n", parsedCount, preo.objectCount);
