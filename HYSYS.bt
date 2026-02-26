@@ -1,20 +1,52 @@
-// HYSYS / Aspen HYSYS Packed Binary case (HSC) - SIMPLE splitter
-// Split objects strictly by marker CC CC and big-endian ObjectSize.
-// SaveID is compact, like BinaryFile::Write (your snippet).
+// HYSYS / Aspen HYSYS Packed Binary case (HSC)
+// Objects are split STRICTLY by:
+//   [CC CC] + [SaveID (compact)] + [ObjectSize (BE)] + [ObjectSize bytes payload]
 //
-// Goal: reliable object boundaries (no deep parsing of CC CD chunks).
+// Unlike the strict splitter, this version does a BEST-EFFORT parse of:
+//   - ObjectName (len + bytes)
+//   - ClassData chunk (CC CD / CC CE, version usually 7)
+//   - Other CC CD / CC CE chunks
 //
-// Tested on Test.hsc (objectCount=57) - should not "skip" objects.
+// Safety goals:
+//   - Never read past ObjectSize boundary
+//   - Always FSeek() to the exact end of each object
+//
+// Tested logic against Test.hsc: objectCount=57, end marker = CC CC FC FF 7F
 
 LittleEndian();
 
-// =====================
+// ------------------------------------------------------------
+// Settings
+// ------------------------------------------------------------
+local int COLOR_OBJECTS = 1;  // 1 = color each object
+
+// ------------------------------------------------------------
+// Helper: stable pseudo-random color by (index, pos)
+// 010 Editor color: 0xBBGGRR
+// ------------------------------------------------------------
+int MakeObjectColor( int index, int64 pos )
+{
+    local uint x;
+    local ubyte r, g, b;
+
+    x = (uint)(pos ^ (pos >> 32));
+    x ^= (uint)(index * 2654435761);
+    x = x * 1664525 + 1013904223;
+
+    r = 0x40 + (ubyte)( x        & 0x7F);
+    g = 0x40 + (ubyte)((x >>  8) & 0x7F);
+    b = 0x40 + (ubyte)((x >> 16) & 0x7F);
+
+    return ((int)b << 16) | ((int)g << 8) | (int)r;
+}
+
+// ------------------------------------------------------------
 // TEXT_U32: [uint len][len bytes]
-// =====================
+// TEXT_U8 : [ubyte len][len bytes]
+// ------------------------------------------------------------
 typedef struct
 {
     uint len <name="Length">;
-
     if( len > 0 )
         char text[len] <name="Text">;
 
@@ -27,9 +59,236 @@ string ReadTEXT_U32( TEXT_U32 &t )
     return "";
 }
 
-// =====================
+// Keep TEXT_U8 as a struct (nice in tree), but we will only use it when bounded.
+typedef struct
+{
+    ubyte len <name="Length">;
+    if( len > 0 )
+        char text[len] <name="Text">;
+
+} TEXT_U8 <read=ReadTEXT_U8>;
+
+string ReadTEXT_U8( TEXT_U8 &t )
+{
+    if( exists(t.text) )
+        return t.text;
+    return "";
+}
+
+// ------------------------------------------------------------
+// Globals for bounded parsing (inside ObjectData)
+// ------------------------------------------------------------
+local int64 g_objectDataEnd = -1; // end of current object's data region
+local int64 g_limitEnd      = -1; // optional tighter bound (e.g. current chunk payload end)
+
+// ------------------------------------------------------------
+// Compact integers / addresses used inside CC CD chunks
+//   CINT: if <255 -> 1 byte, else 0xFF + int32 (LE)
+//   CADDR: 0xFE = NULL/terminator, else like CINT
+// ------------------------------------------------------------
+typedef struct
+{
+    ubyte tag <name="Tag">;
+    if( tag == 0xFF )
+        int value32 <name="Value32">;
+
+} CINT <read=ReadCINT>;
+
+int GetCINT( CINT &c )
+{
+    if( c.tag == 0xFF )
+        return c.value32;
+    return (int)c.tag;
+}
+
+string ReadCINT( CINT &c )
+{
+    local string s;
+    SPrintf( s, "%d", GetCINT(c) );
+    return s;
+}
+
+
+typedef struct
+{
+    ubyte tag <name="Tag">;
+    if( tag == 0xFF )
+        int value32 <name="Value32">;
+
+} CADDR <read=ReadCADDR>;
+
+int GetCADDR( CADDR &a )
+{
+    if( a.tag == 0xFE )
+        return -1;
+    if( a.tag == 0xFF )
+        return a.value32;
+    return (int)a.tag;
+}
+
+string ReadCADDR( CADDR &a )
+{
+    local string s;
+    if( a.tag == 0xFE )
+        return "NULL";
+    SPrintf( s, "%d", GetCADDR(a) );
+    return s;
+}
+
+// Text inside chunks: [CINT len][len bytes]
+// Safe: only reads bytes if fully within bound.
+typedef struct
+{
+    CINT len <name="Length">;
+
+    local int  L   = GetCINT(len);
+    local int64 end = (g_limitEnd > 0) ? g_limitEnd : ((g_objectDataEnd > 0) ? g_objectDataEnd : FileSize());
+
+    // Cap to avoid huge UI allocations in case of garbage
+    if( L > 0 && L <= 0x100000 && (FTell() + (int64)L) <= end )
+        char text[L] <name="Text">;
+
+} TEXT_C <read=ReadTEXT_C>;
+
+string ReadTEXT_C( TEXT_C &t )
+{
+    if( exists(t.text) )
+        return t.text;
+
+    // If length>0 but we didn't create t.text -> invalid / out-of-bounds
+    if( GetCINT(t.len) > 0 )
+        return "<invalid/out-of-bounds>";
+
+    return "";
+}
+
+// ------------------------------------------------------------
+// Chunk header: CC CD / CC CE
+// [ushort marker][int version][CINT size]
+// Note: bytes CC CD read as 0xCDCC because LittleEndian().
+// ------------------------------------------------------------
+typedef struct
+{
+    ushort chunkMarker  <name="ChunkMarker">;
+    int    chunkVersion <name="ChunkVersion">;
+    CINT   chunkSize    <name="ChunkSize">;
+
+} CHUNK_HDR <read=ReadCHUNK_HDR>;
+
+string ReadCHUNK_HDR( CHUNK_HDR &h )
+{
+    local string s;
+    SPrintf( s, "mk=0x%04X ver=%d size=%d", h.chunkMarker, h.chunkVersion, GetCINT(h.chunkSize) );
+    return s;
+}
+
+// ------------------------------------------------------------
+// Generic chunk: eat payload by size (bounded by objectDataEnd)
+// ------------------------------------------------------------
+typedef struct
+{
+    CHUNK_HDR hdr <name="Hdr">;
+
+    local int  payloadSize  = GetCINT(hdr.chunkSize);
+    local int64 payloadStart = FTell();
+    local int64 payloadEnd   = payloadStart + (int64)payloadSize;
+
+    if( g_objectDataEnd > 0 && payloadEnd > g_objectDataEnd )
+        payloadEnd = g_objectDataEnd;
+
+    local int payloadLen = (int)(payloadEnd - payloadStart);
+    if( payloadLen > 0 )
+        ubyte payload[payloadLen] <name="Payload">;
+
+    if( FTell() != payloadEnd )
+        FSeek(payloadEnd);
+
+} GENERIC_CHUNK;
+
+// ------------------------------------------------------------
+// ClassData chunk (StoreClassData) - best effort
+// ------------------------------------------------------------
+typedef struct
+{
+    CHUNK_HDR hdr <name="ClassDataHeader">;
+
+    local int  payloadSize   = GetCINT(hdr.chunkSize);
+    local int64 payloadStart = FTell();
+    local int64 payloadEnd   = payloadStart + (int64)payloadSize;
+
+    if( g_objectDataEnd > 0 && payloadEnd > g_objectDataEnd )
+        payloadEnd = g_objectDataEnd;
+
+    // tighten bounds for TEXT_C
+    local int64 oldLimit = g_limitEnd;
+    g_limitEnd = payloadEnd;
+
+    // ---- Address list (AddrId + Value) ... until NULL ----
+    while( FTell() < payloadEnd )
+    {
+        CADDR addrId <name="AddrId">;
+        if( addrId.tag == 0xFE )
+            break;
+
+        if( FTell() >= payloadEnd )
+            break;
+
+        CINT addrValue <name="AddrValue">;
+    }
+
+    // ---- Parent ----
+    if( FTell() < payloadEnd )
+        CADDR parentId <name="ParentId">;
+
+    // ---- ActiveTabIndex ----
+    if( FTell() < payloadEnd )
+        CINT activeTabIndex <name="ActiveTabIndex">;
+
+    // ---- Misc items ----
+    local int itemIdVal = 0;
+    local ushort mk;
+
+    while( FTell() < payloadEnd )
+    {
+        CINT itemId <name="ItemId">;
+        itemIdVal = GetCINT(itemId);
+        if( itemIdVal == 0 )
+            break;
+
+        // Text name (bounded)
+        TEXT_C itemName <name="ItemName">;
+
+        // If itemName length was non-zero but text couldn't be read -> stop & treat tail as raw
+        if( GetCINT(itemName.len) > 0 && !exists(itemName.text) )
+            break;
+
+        // If next bytes are chunks (CC CD / CC CE), eat them
+        while( FTell() + 2 <= payloadEnd )
+        {
+            mk = ReadUShort(FTell());
+            if( mk == 0xCDCC || mk == 0xCECC )
+                GENERIC_CHUNK itemChunk <name="ItemChunk">;
+            else
+                break;
+        }
+    }
+
+    // ---- Tail ----
+    local int tailLen = (int)(payloadEnd - FTell());
+    if( tailLen > 0 )
+        ubyte classDataTail[tailLen] <name="ClassDataTail">;
+
+    if( FTell() != payloadEnd )
+        FSeek(payloadEnd);
+
+    // restore bound
+    g_limitEnd = oldLimit;
+
+} CLASSDATA_CHUNK;
+
+// ------------------------------------------------------------
 // PackedBinaryFileHeader
-// =====================
+// ------------------------------------------------------------
 typedef struct
 {
     char  myBogusID[16] <name="myBogusID">;
@@ -49,15 +308,15 @@ typedef struct
 FSeek(0);
 PACKED_BINARY_FILE_HEADER hdr;
 
-// sanity (best-effort; you can comment out if needed)
+// best-effort sanity
 Assert(hdr.version == 3, "Unexpected header version (expected 3)");
 Assert(hdr.isCompact == 1, "Unexpected isCompact flag (expected 1)");
 
 AddBookmark(0, "Header", "PACKED_BINARY_FILE_HEADER");
 
-// =====================
+// ------------------------------------------------------------
 // PREO header
-// =====================
+// ------------------------------------------------------------
 typedef struct
 {
     ubyte objectCount        <name="ObjectCount">;
@@ -77,24 +336,22 @@ Assert(preo.preoTag[0]=='P' && preo.preoTag[1]=='R' && preo.preoTag[2]=='E' && p
 
 AddBookmark(preoOff, "PREO header", "PREO_HEADER");
 
-// =====================
+// ------------------------------------------------------------
 // HeaderDataSize + HeaderData (raw)
-// =====================
+// ------------------------------------------------------------
 ubyte headerDataSize <name="HeaderDataSize">;
-
 if( headerDataSize > 0 )
     ubyte headerData[headerDataSize] <name="CollectionHeaderData (raw)">;
 
-// =====================
-// SaveID (compact int like BinaryFile::Write)
+// ------------------------------------------------------------
+// SaveID (compact) for OBJECT header (matches BinaryFile::Write)
 // After CC CC comes compact saveID:
-//
-//  < 0xF0 : 1 byte (value)
-//  0xFE   : special (-32767 / NULL-like)
-//  0xFC   : 0xFC + ushort (LE)
-//  0xFD   : 0xFD + ushort (LE)
-//  0xFF   : 0xFF + int32  (LE)
-// =====================
+//   < 0xF0 : 1 byte (value)
+//   0xFE   : special (-32767 / NULL-like)
+//   0xFC   : 0xFC + ushort (LE)
+//   0xFD   : 0xFD + ushort (LE)
+//   0xFF   : 0xFF + int32  (LE)
+// ------------------------------------------------------------
 typedef struct
 {
     ubyte tag <name="Tag/Prefix">;
@@ -145,7 +402,7 @@ string ReadSAVEID_COMPACT( SAVEID_COMPACT &s )
 
     if( s.tag == 0xFF )
     {
-        SPrintf( out, "0x%08X (tag=0xFF)", v );
+        SPrintf( out, "0x%08X (tag=0xFF)", v, s.tag );
         return out;
     }
 
@@ -153,10 +410,10 @@ string ReadSAVEID_COMPACT( SAVEID_COMPACT &s )
     return out;
 }
 
-// =====================
+// ------------------------------------------------------------
 // EndMarker: CC CC FC FF 7F
-// (i.e. marker=0xCCCC, saveID.tag=0xFC, saveID.value16=0x7FFF)
-// =====================
+// (marker=0xCCCC, saveID.tag=0xFC, saveID.value16=0x7FFF)
+// ------------------------------------------------------------
 typedef struct
 {
     ushort marker <name="Marker">;
@@ -172,15 +429,13 @@ string ReadEND_MARKER( END_MARKER &e )
     return s;
 }
 
-// =====================
-// Object record (STRICT boundary):
-// CC CC
-// SaveID (compact)
-// size (uint32, BE)  -> objectSize bytes AFTER size field
-//
-// Payload: [ubyte nameLen][name bytes][rest bytes]
-// (Name parsing is bounded by objectSize; if invalid, payload is shown raw.)
-// =====================
+// ------------------------------------------------------------
+// OBJECT record:
+//   CC CC
+//   SaveID (compact)
+//   ObjectSize (BE uint32) : number of bytes AFTER size field
+//   Payload[ObjectSize]: [ubyte nameLen][name bytes][ObjectData...]
+// ------------------------------------------------------------
 typedef struct
 {
     ushort marker <name="Marker">;      // 0xCCCC
@@ -195,23 +450,54 @@ typedef struct
 
     if( objectSize > 0 )
     {
-        // Peek nameLen without moving file pointer
+        // Check nameLen within bounds (no overread)
         local uint nameLenPeek = ReadUByte(payloadStart);
 
         if( nameLenPeek <= objectSize - 1 )
         {
-            ubyte nameLen <name="NameLen">;
+            // Name
+            TEXT_U8 objectName <name="ObjectName">;
 
-            if( nameLen > 0 )
-                char objectName[nameLen] <name="ObjectName">;
+            // ObjectData begins here
+            local int64 objDataStart = FTell();
+            local int64 objDataEnd   = payloadEnd;
 
-            local uint restLen = (objectSize - 1) - (uint)nameLen;
-            if( restLen > 0 )
-                ubyte objectData[restLen] <name="ObjectData">;
+            if( objDataStart < objDataEnd )
+            {
+                g_objectDataEnd = objDataEnd;
+
+                local ushort mk0;
+                local ushort mk;
+
+                // 1) ClassData (first chunk) if present
+                if( FTell() + 2 <= objDataEnd )
+                {
+                    mk0 = ReadUShort(FTell());
+                    if( mk0 == 0xCDCC || mk0 == 0xCECC )
+                        CLASSDATA_CHUNK classData <name="ClassData">;
+                }
+
+                // 2) Other chunks
+                while( FTell() + 2 <= objDataEnd )
+                {
+                    mk = ReadUShort(FTell());
+                    if( mk == 0xCDCC || mk == 0xCECC )
+                        GENERIC_CHUNK chunk <name="Chunk">;
+                    else
+                        break;
+                }
+
+                // 3) Tail
+                if( FTell() < objDataEnd )
+                    ubyte objectDataRest[(int)(objDataEnd - FTell())] <name="ObjectDataRest">;
+
+                g_objectDataEnd = -1;
+                g_limitEnd      = -1;
+            }
         }
         else
         {
-            // Not a valid [len][text] start -> show payload raw
+            // payload doesn't start with bounded [len][text] -> show raw
             ubyte payloadRaw[objectSize] <name="PayloadRaw">;
         }
     }
@@ -227,14 +513,13 @@ string ReadOBJECT_RECORD( OBJECT_RECORD &o )
     local int sid = GetSAVEID_COMPACT(o.saveID);
 
     local string nm = "";
-    if( exists(o.objectName) )
-        nm = o.objectName;
+    if( exists(o.objectName) && exists(o.objectName.text) )
+        nm = o.objectName.text;
 
     if( nm == "" )
         nm = "(no name)";
 
     local string s;
-
     if( sid >= 0 && sid <= 0xFFFF )
         SPrintf( s, "%s | saveID=0x%04X | tag=0x%02X | size=%u", nm, sid, o.saveID.tag, o.objectSize );
     else
@@ -243,21 +528,32 @@ string ReadOBJECT_RECORD( OBJECT_RECORD &o )
     return s;
 }
 
-// =====================
+// ------------------------------------------------------------
 // Objects: parse EXACTLY preo.objectCount records
-// =====================
+// ------------------------------------------------------------
 local int64 objectsStart = FTell();
 AddBookmark(objectsStart, "ObjectsStart", "ubyte");
 
 local string objNodeName;
 local int i;
+local int objColor;
 
 for( i = 0; i < (int)preo.objectCount; i++ )
 {
+    // If position is wrong, stop early with an informative assert.
     Assert( ReadUShort(FTell()) == 0xCCCC, "Expected object marker CC CC" );
+
+    if( COLOR_OBJECTS )
+    {
+        objColor = MakeObjectColor( i, FTell() );
+        SetBackColor( objColor );
+    }
 
     SPrintf( objNodeName, "Object[%d]", i );
     OBJECT_RECORD obj <name=objNodeName, open=false, optimize=false>;
+
+    if( COLOR_OBJECTS )
+        SetBackColor( cNone );
 }
 
 // End marker must follow objects
