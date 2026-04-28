@@ -60,16 +60,16 @@ if errorlevel 1 (
 )
 
 echo [4/5] Git mirror backup...
-call :mirror_repo "http://gitlab.local/tsoft/flowengine" "flowengine.git"
+call :mirror_repo "https://flowengine.t-soft.ru/tsoft/flowengine" "flowengine.git"
 if errorlevel 1 exit /b 1
 
-call :mirror_repo "http://gitlab.local/tsoft/flowengine.wiki" "flowengine.wiki.git"
+call :mirror_repo "https://flowengine.t-soft.ru/tsoft/flowengine.wiki" "flowengine.wiki.git"
 if errorlevel 1 exit /b 1
 
-call :mirror_repo "http://gitlab.local/tsoft/flowengineui" "flowengineui.git"
+call :mirror_repo "https://flowengine.t-soft.ru/tsoft/flowengineui" "flowengineui.git"
 if errorlevel 1 exit /b 1
 
-call :mirror_repo "http://gitlab.local/tsoft/flowengineui.wiki" "flowengineui.wiki.git"
+call :mirror_repo "https://flowengine.t-soft.ru/tsoft/flowengineui.wiki" "flowengineui.wiki.git"
 if errorlevel 1 exit /b 1
 
 echo [5/5] Done.
