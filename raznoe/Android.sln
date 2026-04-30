@@ -1,0 +1,26 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 9.00
+# Visual Studio 2005
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "flowengineui", "flowengineui\flowengineui.vcproj", "{BDF9F3AD-68A5-45E4-92D6-0E78005FD72B}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "flowengine", "flowengine\src\flowengine\flowengine\flowengine.vcproj", "{20CE3587-2D69-45BA-BE13-9742BD109372}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Win32 = Debug|Win32
+		Release|Win32 = Release|Win32
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{BDF9F3AD-68A5-45E4-92D6-0E78005FD72B}.Debug|Win32.ActiveCfg = Debug|Win32
+		{BDF9F3AD-68A5-45E4-92D6-0E78005FD72B}.Debug|Win32.Build.0 = Debug|Win32
+		{BDF9F3AD-68A5-45E4-92D6-0E78005FD72B}.Release|Win32.ActiveCfg = Release|Win32
+		{BDF9F3AD-68A5-45E4-92D6-0E78005FD72B}.Release|Win32.Build.0 = Release|Win32
+		{20CE3587-2D69-45BA-BE13-9742BD109372}.Debug|Win32.ActiveCfg = Debug|Win32
+		{20CE3587-2D69-45BA-BE13-9742BD109372}.Debug|Win32.Build.0 = Debug|Win32
+		{20CE3587-2D69-45BA-BE13-9742BD109372}.Release|Win32.ActiveCfg = Release|Win32
+		{20CE3587-2D69-45BA-BE13-9742BD109372}.Release|Win32.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

@@ -1,0 +1,17 @@
+Добавь шаг копирования перед “Build Android APK”
+
+Projects → Build Steps → Add Build Step → Custom Process Step (перед Build Android APK)
+
+Command: cmd
+
+Arguments: /c mkdir "%{buildDir}\android-build\libs\armeabi-v7a" 2>nul & copy /y "D:\work\Android\flowengine\src\flowengine\build-flowengine-Android_for_armeabi_v7a_arm64_v8a_x86_x86_64_Clang_Qt_5_14_2_for_Android-Debug\libflowengine.so" "%{buildDir}\android-build\libs\armeabi-v7a\"
+
+%{buildDir} — это переменная Qt Creator, она подставится в путь build-папки flowengineui автоматически.
+
+для релиза:
+
+Projects → Build Steps → Build Android APK
+поставить галочку Sign package и нажать Create 
+
+в cmd сделать: 
+copy /y D:\Android\Sdk\build-tools\30.0.3\zipalign.exe D:\Android\Sdk\build-tools\zipalign.exe
